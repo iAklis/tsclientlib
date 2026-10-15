@@ -35,3 +35,50 @@ fn negative_iconid() { test_iconid("-96136942", 4198830354); }
 
 #[test]
 fn big_iconid() { test_iconid("18446744073225738240", 3811153920); }
+
+#[tokio::test]
+async fn a_failed_connection_future_is_not_polled_after_completion() {
+	use crate::{Connection, ConnectionState, Error, Identity, TsError};
+	use futures::{FutureExt, StreamExt};
+	let mut connection =
+		Connection::build("127.0.0.1:1").identity(Identity::create()).connect().unwrap();
+	connection.state = ConnectionState::Connecting(
+		async { Err(Error::ConnectTs(TsError::ConnectFailedBanned)) }.boxed(),
+		false,
+	);
+	assert!(matches!(connection.events().next().await, Some(Err(Error::ConnectTs(_)))));
+	assert!(connection.events().next().await.is_none());
+	assert!(connection.events().next().await.is_none());
+}
+
+#[tokio::test]
+async fn an_identity_level_failure_closes_the_completed_connection_future() {
+	use crate::{Connection, ConnectionState, Error, Identity};
+	use futures::{FutureExt, StreamExt};
+	let mut connection =
+		Connection::build("127.0.0.1:1").identity(Identity::create()).connect().unwrap();
+	connection.state =
+		ConnectionState::Connecting(async { Err(Error::IdentityLevel(21)) }.boxed(), false);
+	assert!(matches!(connection.events().next().await, Some(Err(Error::IdentityLevel(21)))));
+	assert!(connection.events().next().await.is_none());
+}
+
+#[tokio::test]
+async fn a_dropped_identity_upgrade_sender_closes_the_event_stream() {
+	use crate::{Connection, ConnectionState, Error, Identity, IdentityIncreaseLevelState};
+	use futures::StreamExt;
+	let mut connection =
+		Connection::build("127.0.0.1:1").identity(Identity::create()).connect().unwrap();
+	let (send, recv) = tokio::sync::oneshot::channel();
+	drop(send);
+	connection.state = ConnectionState::IdentityLevelIncreasing {
+		recv,
+		state: std::sync::Arc::new(std::sync::Mutex::new(IdentityIncreaseLevelState::Computing)),
+	};
+	assert!(matches!(
+		connection.events().next().await,
+		Some(Err(Error::IdentityLevelIncreaseFailedThread))
+	));
+	assert!(connection.events().next().await.is_none());
+	assert!(connection.events().next().await.is_none());
+}

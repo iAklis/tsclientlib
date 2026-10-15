@@ -282,6 +282,7 @@ struct ConnectedConnection {
 }
 
 enum ConnectionState {
+	Closed,
 	/// The future that resolves to a connection and a boolean if we should reconnect on failure.
 	///
 	/// If the `bool` is `false`, the connection will abort on error. Otherwise it will try to
@@ -1117,10 +1118,12 @@ impl Connection {
 			return Poll::Ready(Some(item));
 		}
 		match &mut self.state {
+			ConnectionState::Closed => Poll::Ready(None),
 			ConnectionState::Connecting(fut, reconnect) => match fut.poll_unpin(cx) {
 				Poll::Pending => Poll::Pending,
 				Poll::Ready(Err(Error::IdentityLevel(level))) => {
 					if let Err(e) = self.increase_identity_level(level) {
+						self.state = ConnectionState::Closed;
 						return Poll::Ready(Some(Err(e)));
 					}
 					Poll::Ready(Some(Ok(StreamItem::IdentityLevelIncreasing(level))))
@@ -1142,6 +1145,7 @@ impl Connection {
 							}
 						}
 					}
+					self.state = ConnectionState::Closed;
 					Poll::Ready(Some(Err(e)))
 				}
 				Poll::Ready(Ok((client, book))) => {
@@ -1175,6 +1179,7 @@ impl Connection {
 			ConnectionState::IdentityLevelIncreasing { recv, .. } => match recv.poll_unpin(cx) {
 				Poll::Pending => Poll::Pending,
 				Poll::Ready(Err(_)) => {
+					self.state = ConnectionState::Closed;
 					Poll::Ready(Some(Err(Error::IdentityLevelIncreaseFailedThread)))
 				}
 				Poll::Ready(Ok(identity)) => {
