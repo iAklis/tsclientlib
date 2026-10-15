@@ -30,7 +30,7 @@ use thiserror::Error;
 use time::OffsetDateTime;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpStream, UdpSocket};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 use tracing::{debug, info, info_span, warn, Instrument, Span};
 use ts_bookkeeping::messages::c2s;
 use ts_bookkeeping::messages::OutMessageTrait;
@@ -377,6 +377,7 @@ impl Connection {
 			address: address.into(),
 			local_address: None,
 			identity: None,
+			cancellation: watch::channel(false).0,
 			server: None,
 			name: "TeamSpeakUser".into(),
 			version: Version::Windows_3_X_X__1,
@@ -445,24 +446,49 @@ impl Connection {
 	async fn connect(
 		options: ConnectOptions, is_reconnect: bool,
 	) -> Result<(client::Client, data::Connection)> {
+		if *options.cancellation.borrow() {
+			return Err(Error::ConnectionGone);
+		}
 		if is_reconnect {
-			tokio::time::sleep(Duration::from_secs(10)).await;
+			let mut cancellation = options.cancellation.subscribe();
+			tokio::select! {
+				biased;
+				_ = Self::cancelled(&mut cancellation) => return Err(Error::ConnectionGone),
+				_ = tokio::time::sleep(Duration::from_secs(10)) => {},
+			}
 		}
 
 		let resolved = match &options.address {
 			ServerAddress::SocketAddr(a) => stream::once(future::ok(*a)).left_stream(),
 			ServerAddress::Other(s) => resolver::resolve(s.into()).right_stream(),
 		};
+		Self::connect_resolved(&options, resolved).await
+	}
+
+	async fn connect_resolved(
+		options: &ConnectOptions,
+		resolved: impl Stream<Item = std::result::Result<SocketAddr, resolver::Error>>,
+	) -> Result<(client::Client, data::Connection)> {
 		pin_utils::pin_mut!(resolved);
 		let mut resolved: Pin<_> = resolved;
 
+		let mut cancellation = options.cancellation.subscribe();
 		let mut errors = Vec::new();
-		while let Some(addr) = resolved.next().await {
+		loop {
+			let Some(addr) = (tokio::select! {
+				biased;
+				_ = Self::cancelled(&mut cancellation) => return Err(Error::ConnectionGone),
+				addr = resolved.next() => addr,
+			}) else {
+				break;
+			};
 			let addr = addr.map_err(|e| Error::ResolveAddress(Box::new(e)))?;
-			match Self::connect_to(&options, addr).await {
+			match Self::connect_to(options, addr).await {
 				Ok(res) => return Ok(res),
-				Err(e @ Error::IdentityLevel(_)) | Err(e @ Error::ConnectTs(_)) => {
-					// Either increase identity level or the server refused us
+				Err(e @ Error::ConnectionGone)
+				| Err(e @ Error::IdentityLevel(_))
+				| Err(e @ Error::ConnectTs(_)) => {
+					// Cancellation and server login responses apply to the whole attempt.
 					return Err(e);
 				}
 				Err(error) => {
@@ -502,7 +528,12 @@ impl Connection {
 
 		// Create a connection
 		debug!(address = %addr, "Connecting");
-		client.connect().await.map_err(Error::Connect)?;
+		let mut cancellation = options.cancellation.subscribe();
+		tokio::select! {
+			biased;
+			_ = Self::cancelled(&mut cancellation) => return Err(Error::ConnectionGone),
+			result = client.connect() => result.map_err(Error::Connect)?,
+		}
 
 		if let Some(server_uid) = &options.server {
 			let params = if let Some(r) = &client.params {
@@ -559,22 +590,75 @@ impl Connection {
 			security_hash: None,
 		}));
 
+		if *cancellation.borrow() {
+			return Err(Error::ConnectionGone);
+		}
 		client.send_packet(packet.into_packet()).map_err(Error::SendClientinit)?;
 
-		match tokio::time::timeout(
-			Duration::from_secs(INITSERVER_TIMEOUT),
-			Self::wait_initserver(client),
-		)
-		.await
-		{
-			Ok(r) => r,
-			Err(_) => Err(Error::InitserverTimeout),
+		let result = tokio::select! {
+			biased;
+			_ = Self::cancelled(&mut cancellation) => {
+				Self::close_pending(&mut client, &mut cancellation, Duration::from_millis(1800)).await;
+				Err(Error::ConnectionGone)
+			},
+			result = tokio::time::timeout(
+				Duration::from_secs(INITSERVER_TIMEOUT),
+				Self::wait_initserver(&mut client),
+			) => match result {
+				Ok(r) => r,
+				Err(_) => Err(Error::InitserverTimeout),
+			},
+		};
+		if result.as_ref().is_err_and(|error| !matches!(error,
+			Error::ConnectionGone | Error::ConnectTs(_) | Error::IdentityLevel(_))) {
+			// A timeout or parse/transport failure after clientinit has the same
+			// possible server membership as cancellation. Clean up before dropping.
+			Self::close_pending(&mut client, &mut cancellation, Duration::from_secs(10)).await;
+		}
+		result.map(|book| (client, book))
+	}
+
+	async fn close_pending(client: &mut client::Client, cancellation: &mut watch::Receiver<bool>, grace: Duration) {
+		// Stop pending login commands before draining; cleanup must not resend
+		// clientinit or create a new membership after cancellation/failure.
+		client.resender.discard_commands();
+		let cleanup = async {
+			while client.params.as_ref().is_some_and(|params| params.c_id == 0) {
+				match client.next().await {
+					Some(Ok(_)) => {},
+					_ => return,
+				}
+			}
+			if client.params.as_ref().is_none_or(|params| params.c_id == 0) {
+				return;
+			}
+			let packet = c2s::OutDisconnectMessage::new(&mut iter::once(c2s::OutDisconnectPart {
+				reason: Some(ts_bookkeeping::Reason::Clientdisconnect),
+				reason_message: None,
+			}));
+			if client.send_packet(packet.into_packet()).is_ok() {
+				let _ = client.wait_disconnect().await;
+			}
+		};
+		tokio::pin!(cleanup);
+		tokio::select! {
+			biased;
+			_ = Self::cancelled(cancellation) => {
+				// Shutdown/caller cancellation always keeps the short grace even
+				// when a normal receive failure was already being cleaned up.
+				let _ = tokio::time::timeout(Duration::from_millis(1800), &mut cleanup).await;
+			},
+			_ = tokio::time::timeout(grace, &mut cleanup) => {},
 		}
 	}
 
-	async fn wait_initserver(
-		mut client: client::Client,
-	) -> Result<(client::Client, data::Connection)> {
+	async fn cancelled(receiver: &mut watch::Receiver<bool>) {
+		if !*receiver.borrow() {
+			let _ = receiver.changed().await;
+		}
+	}
+
+	async fn wait_initserver(client: &mut client::Client) -> Result<data::Connection> {
 		// Wait until we received the initserver packet.
 		loop {
 			let cmd = client
@@ -610,7 +694,7 @@ impl Connection {
 					// Create connection
 					let data = data::Connection::new(public_key, &initserver);
 
-					return Ok((client, data));
+					return Ok(data);
 				}
 				Ok(msg) => {
 					// TODO Save instead of drop
@@ -860,6 +944,11 @@ impl Connection {
 
 	/// Disconnect from the server.
 	///
+	/// This also cancels pending connection and reconnect attempts. Keep polling
+	/// [`events`](Self::events) afterwards so best-effort cleanup can run. Cleanup
+	/// waits for server replies only for a limited time; delayed replies can prevent
+	/// immediate removal from the server.
+	///
 	/// # Arguments
 	/// - `options`: Either `None` or `DisconnectOptions`.
 	///
@@ -914,6 +1003,15 @@ impl Connection {
 	/// # }
 	/// ```
 	pub fn disconnect(&mut self, options: DisconnectOptions) -> Result<()> {
+		self.options.cancellation.send_replace(true);
+		if let ConnectionState::IdentityLevelIncreasing { recv, .. } = &mut self.state {
+			// Preserve a completed upgrade without initiating its subsequent login.
+			if let Ok(identity) = recv.try_recv() {
+				self.options.identity = Some(identity);
+			}
+			self.cancel_identity_level_increase();
+			self.state = ConnectionState::Closed;
+		}
 		if let ConnectionState::Connected { con, book } = &mut self.state {
 			let packet = book.disconnect(options);
 			con.client.send_packet(packet.into_packet()).map_err(Error::SendPacket)?;
@@ -1122,6 +1220,10 @@ impl Connection {
 			ConnectionState::Connecting(fut, reconnect) => match fut.poll_unpin(cx) {
 				Poll::Pending => Poll::Pending,
 				Poll::Ready(Err(Error::IdentityLevel(level))) => {
+					if *self.options.cancellation.borrow() {
+						self.state = ConnectionState::Closed;
+						return Poll::Ready(None);
+					}
 					if let Err(e) = self.increase_identity_level(level) {
 						self.state = ConnectionState::Closed;
 						return Poll::Ready(Some(Err(e)));
@@ -1129,6 +1231,10 @@ impl Connection {
 					Poll::Ready(Some(Ok(StreamItem::IdentityLevelIncreasing(level))))
 				}
 				Poll::Ready(Err(e)) => {
+					if *self.options.cancellation.borrow() {
+						self.state = ConnectionState::Closed;
+						return Poll::Ready(None);
+					}
 					if *reconnect {
 						if let Error::ConnectFailed { errors, .. } = &e {
 							for e in errors {
@@ -1695,6 +1801,7 @@ pub struct ConnectOptions {
 	address: ServerAddress,
 	local_address: Option<SocketAddr>,
 	identity: Option<Identity>,
+	cancellation: watch::Sender<bool>,
 	server: Option<UidBuf>,
 	name: Cow<'static, str>,
 	version: Version,
@@ -1750,6 +1857,9 @@ impl ConnectOptions {
 	/// # }
 	/// ```
 	pub fn connect(mut self) -> Result<Connection> {
+		// Cancellation belongs to this connection, including its internal retries.
+		// A caller may reuse options from a previously disconnected connection.
+		self.cancellation = watch::channel(false).0;
 		let span = info_span!("connection", addr = %self.address).entered();
 
 		#[cfg(debug_assertions)]
