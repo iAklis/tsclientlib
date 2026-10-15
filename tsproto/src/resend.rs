@@ -412,6 +412,14 @@ impl Default for Resender {
 }
 
 impl Resender {
+	/// Abandon pending commands when closing a login before initserver arrives.
+	/// This is not an acknowledgement and does not alter network statistics.
+	pub fn discard_commands(&mut self) {
+		self.full_send_queue[1].clear();
+		self.full_send_queue[2].clear();
+		self.send_queue.retain(|record| record.id.packet_type == PacketType::Init);
+	}
+
 	fn packet_type_to_index(t: PacketType) -> usize {
 		match t {
 			PacketType::Init => 0,
@@ -1063,5 +1071,46 @@ impl PacketStat {
 				}
 			}
 		}
+	}
+}
+
+#[cfg(test)]
+mod discard_tests {
+	use super::*;
+
+	#[tokio::test]
+	async fn discarding_pending_commands_keeps_init_and_does_not_forge_acknowledgements() {
+		let mut resender = Resender::default();
+		let now = Instant::now();
+		for packet_type in [PacketType::Init, PacketType::Command, PacketType::CommandLow] {
+			let part = PartialPacketId { generation_id: 0, packet_id: 7 };
+			let id = SendRecordId { last: now, tries: 1, id: PacketId { packet_type, part } };
+			let packet = OutUdpPacket::new(
+				0,
+				OutPacket::new_with_dir(Direction::C2S, Flags::empty(), packet_type),
+			);
+			resender.full_send_queue[Resender::packet_type_to_index(packet_type)]
+				.insert(part, SendRecord { sent: now, id: id.clone(), packet });
+			resender.send_queue.push(id);
+		}
+		resender.stats_counter.packet_loss[PacketLossStat::AckInCount as usize] = 11;
+		resender.stats_counter.packet_loss[PacketLossStat::CommandOutCount as usize] = 3;
+		resender.stats.total_packets[PacketStat::OutControl as usize] = 17;
+		resender.stats.total_bytes[PacketStat::OutControl as usize] = 2048;
+		let counters = resender.stats_counter.clone();
+		let stats = resender.stats.clone();
+		let srtt = resender.config.srtt;
+		resender.discard_commands();
+		assert!(resender.full_send_queue[1].is_empty());
+		assert!(resender.full_send_queue[2].is_empty());
+		assert_eq!(resender.full_send_queue[0].len(), 1);
+		assert_eq!(resender.send_queue.len(), 1);
+		assert!(resender.send_queue.iter().all(|record| record.id.packet_type == PacketType::Init));
+		assert_eq!(resender.stats_counter.bytes, counters.bytes);
+		assert_eq!(resender.stats_counter.packet_loss, counters.packet_loss);
+		assert_eq!(resender.stats.total_packets, stats.total_packets);
+		assert_eq!(resender.stats.total_bytes, stats.total_bytes);
+		assert_eq!(resender.stats.packet_loss, stats.packet_loss);
+		assert_eq!(resender.config.srtt, srtt);
 	}
 }
