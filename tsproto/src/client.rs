@@ -249,6 +249,7 @@ impl Client {
 		let random0 = rand::rng().random::<[u8; 4]>();
 
 		let alpha;
+		let mut restarts = 0u32;
 		loop {
 			// Wait for Init1
 			{
@@ -278,6 +279,13 @@ impl Client {
 			{
 				let init3 = self.get_init(&[3, 127]).await?;
 				if init3.data().data().get_step() == 127 {
+					// A busy server can request a restart. Never turn this into a
+					// tight handshake loop, even when responses arrive immediately.
+					if restarts >= 3 {
+						return Err(crate::Error::Timeout("init restart limit").into());
+					}
+					tokio::time::sleep(std::time::Duration::from_millis(250 << restarts)).await;
+					restarts += 1;
 					continue;
 				}
 				match init3.data().data() {
@@ -711,6 +719,7 @@ impl Stream for Client {
 mod tests {
 	use std::cell::Cell;
 	use std::collections::VecDeque;
+	use std::convert::TryInto;
 	use std::io;
 	use std::sync::{Arc, Mutex};
 	use std::task::Waker;
@@ -947,6 +956,74 @@ mod tests {
 			params.c_id = 1;
 			con.params = Some(params);
 		}
+	}
+
+	/// A server-requested restart must not become an unlimited immediate loop.
+	#[tokio::test]
+	async fn repeated_init127_is_delayed_and_stops_after_three_restarts() -> Result<()> {
+		let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+		let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+		let mut client =
+			Client::new(server.local_addr()?, Box::new(socket), EccKeyPrivP256::create());
+		let connect = client.connect();
+		futures::pin_mut!(connect);
+		let started = time::Instant::now();
+		let mut init0 = Vec::new();
+		let mut init2 = 0;
+		let mut last_step = None;
+		let mut packets = 0;
+		let mut buffer = [0; 1500];
+		let result = loop {
+			tokio::select! {
+				result = &mut connect => break result,
+				_ = time::sleep_until(started + Duration::from_secs(6)) => {
+					panic!("restart limit did not stop the connection");
+				},
+				packet = server.recv_from(&mut buffer) => {
+					let (length, from) = packet?;
+					packets += 1;
+					assert!(packets <= 64, "handshake packet burst exceeded the bounded fixture");
+					assert!(length >= 26 && &buffer[..8] == b"TS3INIT1");
+					let incoming = InPacket::new(Direction::C2S, &buffer[..length]);
+					assert_eq!(incoming.header().packet_type(), PacketType::Init);
+					match incoming.content()[4] {
+						0 => {
+							if last_step != Some(0) {
+								init0.push(time::Instant::now());
+								last_step = Some(0);
+							}
+							let mut reversed: [u8; 4] = incoming.content()[9..13].try_into().unwrap();
+							reversed.reverse();
+							let mut reply = OutS2CInit1::new(&[1; 16], reversed);
+							reply.flags(Flags::UNENCRYPTED);
+							server.send_to(reply.data(), from).await?;
+						},
+						2 => {
+							if last_step != Some(2) {
+								init2 += 1;
+								last_step = Some(2);
+							}
+							let mut reply = OutPacket::new_with_dir(Direction::S2C, Flags::UNENCRYPTED, PacketType::Init);
+							reply.mac().copy_from_slice(b"TS3INIT1");
+							reply.packet_id(0x65);
+							reply.data_mut().push(127);
+							server.send_to(reply.data(), from).await?;
+						},
+						other => panic!("unexpected handshake step {}", other),
+					}
+				},
+			}
+		};
+		assert!(matches!(result, Err(Error::TsProto(crate::Error::Timeout("init restart limit")))));
+		assert_eq!(init0.len(), 4);
+		assert_eq!(init2, 4);
+		for (times, minimum) in init0.windows(2).zip([240, 490, 990]) {
+			assert!(times[1].duration_since(times[0]) >= Duration::from_millis(minimum));
+		}
+		assert!(
+			time::timeout(Duration::from_millis(100), server.recv_from(&mut buffer)).await.is_err()
+		);
+		Ok(())
 	}
 
 	/// Check if init packet is sent and connect timeout is working.
