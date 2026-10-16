@@ -35,3 +35,239 @@ fn negative_iconid() { test_iconid("-96136942", 4198830354); }
 
 #[test]
 fn big_iconid() { test_iconid("18446744073225738240", 3811153920); }
+
+#[tokio::test]
+async fn disconnect_before_polling_does_not_start_a_handshake() {
+	use crate::{Connection, DisconnectOptions, Identity};
+	use futures::StreamExt;
+	use std::time::Duration;
+	let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+	let mut connection = Connection::build(server.local_addr().unwrap())
+		.identity(Identity::create())
+		.connect()
+		.unwrap();
+	connection.disconnect(DisconnectOptions::new()).unwrap();
+	assert!(
+		tokio::time::timeout(Duration::from_millis(100), connection.events().next())
+			.await
+			.unwrap()
+			.is_none()
+	);
+	assert!(
+		tokio::time::timeout(Duration::from_millis(50), server.recv_from(&mut [0; 1500]))
+			.await
+			.is_err()
+	);
+}
+
+#[tokio::test]
+async fn a_failed_connection_future_is_not_polled_after_completion() {
+	use crate::{Connection, ConnectionState, Error, Identity, TsError};
+	use futures::{FutureExt, StreamExt};
+	let mut connection =
+		Connection::build("127.0.0.1:1").identity(Identity::create()).connect().unwrap();
+	connection.state = ConnectionState::Connecting(
+		async { Err(Error::ConnectTs(TsError::ConnectFailedBanned)) }.boxed(),
+		false,
+	);
+	assert!(matches!(connection.events().next().await, Some(Err(Error::ConnectTs(_)))));
+	assert!(connection.events().next().await.is_none());
+	assert!(connection.events().next().await.is_none());
+}
+
+#[tokio::test]
+async fn an_identity_level_failure_closes_the_completed_connection_future() {
+	use crate::{Connection, ConnectionState, Error, Identity};
+	use futures::{FutureExt, StreamExt};
+	let mut connection =
+		Connection::build("127.0.0.1:1").identity(Identity::create()).connect().unwrap();
+	connection.state =
+		ConnectionState::Connecting(async { Err(Error::IdentityLevel(21)) }.boxed(), false);
+	assert!(matches!(connection.events().next().await, Some(Err(Error::IdentityLevel(21)))));
+	assert!(connection.events().next().await.is_none());
+}
+
+#[tokio::test]
+async fn disconnect_preserves_a_completed_identity_upgrade_without_starting_a_login() {
+	use crate::{
+		Connection, ConnectionState, DisconnectOptions, Identity, IdentityIncreaseLevelState,
+	};
+	use futures::StreamExt;
+	let seed = Identity::create();
+	let mut identity = Identity::new(seed.key().clone(), 0);
+	while identity.level() != 0 {
+		identity.set_counter(identity.counter() + 1);
+		identity.set_max_counter(identity.counter());
+	}
+	let mut upgraded = identity.clone();
+	upgraded.upgrade_level(8);
+	let (send, recv) = tokio::sync::oneshot::channel();
+	assert!(send.send(upgraded.clone()).is_ok());
+	let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+	let mut connection =
+		Connection::build(server.local_addr().unwrap()).identity(identity).connect().unwrap();
+	connection.state = ConnectionState::IdentityLevelIncreasing {
+		recv,
+		state: std::sync::Arc::new(std::sync::Mutex::new(IdentityIncreaseLevelState::Computing)),
+	};
+	connection.disconnect(DisconnectOptions::new()).unwrap();
+	let preserved = connection.get_options().get_identity().unwrap();
+	assert_eq!(preserved.counter(), upgraded.counter());
+	assert_eq!(preserved.max_counter(), upgraded.max_counter());
+	assert!(connection.events().next().await.is_none());
+	assert!(
+		tokio::time::timeout(
+			std::time::Duration::from_millis(50),
+			server.recv_from(&mut [0; 1500])
+		)
+		.await
+		.is_err()
+	);
+}
+
+#[tokio::test]
+async fn disconnect_while_resolving_ends_the_connection() {
+	use crate::{Connection, ConnectionState, DisconnectOptions, Identity};
+	use futures::{FutureExt, StreamExt};
+	use std::time::Duration;
+	let mut connection =
+		Connection::build("127.0.0.1:1").identity(Identity::create()).connect().unwrap();
+	let options = connection.options.clone();
+	connection.state = ConnectionState::Connecting(
+		async move {
+			Connection::connect_resolved(&options, futures::stream::pending()).await
+		}
+		.boxed(),
+		false,
+	);
+	assert!(connection.events().next().now_or_never().is_none());
+	connection.disconnect(DisconnectOptions::new()).unwrap();
+	assert!(
+		tokio::time::timeout(Duration::from_millis(100), connection.events().next())
+			.await
+			.expect("cancelled resolution must not wait for an address")
+			.is_none()
+	);
+}
+
+#[tokio::test]
+async fn disconnect_during_handshake_does_not_poll_more_resolved_addresses() {
+	use crate::{Connection, ConnectionState, DisconnectOptions, Identity};
+	use futures::{FutureExt, StreamExt};
+	use std::sync::atomic::{AtomicUsize, Ordering};
+	use std::sync::Arc;
+	use std::task::Poll;
+	use std::time::Duration;
+	let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+	let address = server.local_addr().unwrap();
+	let mut connection = Connection::build(address).identity(Identity::create()).connect().unwrap();
+	let options = connection.options.clone();
+	let further_polls = Arc::new(AtomicUsize::new(0));
+	let observed_polls = further_polls.clone();
+	let resolved = futures::stream::once(futures::future::ready(Ok(address))).chain(
+		futures::stream::poll_fn(move |_| {
+			further_polls.fetch_add(1, Ordering::SeqCst);
+			Poll::Pending
+		}),
+	);
+	connection.state = ConnectionState::Connecting(
+		async move { Connection::connect_resolved(&options, resolved).await }.boxed(),
+		false,
+	);
+	let mut packet = [0; 1500];
+	tokio::select! {
+		result = server.recv_from(&mut packet) => {
+			let (length, _) = result.unwrap();
+			assert!(length >= 8 && &packet[..8] == b"TS3INIT1");
+		},
+		result = async { connection.events().next().await } => panic!("handshake ended before cancellation: {:?}", result),
+		_ = tokio::time::sleep(Duration::from_secs(1)) => panic!("handshake did not start"),
+	}
+	connection.disconnect(DisconnectOptions::new()).unwrap();
+	assert!(
+		tokio::time::timeout(Duration::from_millis(100), connection.events().next())
+			.await
+			.expect("cancelled handshake must not continue resolving")
+			.is_none()
+	);
+	assert_eq!(observed_polls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn disconnect_during_reconnect_delay_ends_without_a_handshake() {
+	use crate::{Connection, ConnectionState, DisconnectOptions, Identity};
+	use futures::{FutureExt, StreamExt};
+	use std::time::Duration;
+	let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+	let mut connection = Connection::build(server.local_addr().unwrap())
+		.identity(Identity::create())
+		.connect()
+		.unwrap();
+	connection.state = ConnectionState::Connecting(
+		Connection::connect(connection.options.clone(), true).boxed(),
+		true,
+	);
+	assert!(connection.events().next().now_or_never().is_none());
+	connection.disconnect(DisconnectOptions::new()).unwrap();
+	assert!(
+		tokio::time::timeout(Duration::from_millis(100), connection.events().next())
+			.await
+			.expect("cancellation must not wait for the reconnect delay")
+			.is_none()
+	);
+	assert!(
+		tokio::time::timeout(Duration::from_millis(50), server.recv_from(&mut [0; 1500]))
+			.await
+			.is_err()
+	);
+}
+
+#[tokio::test]
+async fn reusing_options_from_a_cancelled_connection_starts_a_new_handshake() {
+	use crate::{Connection, DisconnectOptions, Identity};
+	use futures::StreamExt;
+	use std::time::Duration;
+	let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+	let mut cancelled = Connection::build(server.local_addr().unwrap())
+		.identity(Identity::create())
+		.connect()
+		.unwrap();
+	cancelled.disconnect(DisconnectOptions::new()).unwrap();
+	let mut connection = cancelled.get_options().clone().connect().unwrap();
+	let mut packet = [0; 1500];
+	tokio::select! {
+		result = server.recv_from(&mut packet) => {
+			let (length, _) = result.unwrap();
+			assert!(length >= 8 && &packet[..8] == b"TS3INIT1");
+		},
+		result = async { connection.events().next().await } => panic!("reused options did not start a connection: {:?}", result),
+		_ = tokio::time::sleep(Duration::from_secs(1)) => panic!("reused options did not start a handshake"),
+	}
+	connection.disconnect(DisconnectOptions::new()).unwrap();
+	assert!(
+		tokio::time::timeout(Duration::from_millis(100), connection.events().next())
+			.await
+			.unwrap()
+			.is_none()
+	);
+}
+
+#[tokio::test]
+async fn a_dropped_identity_upgrade_sender_closes_the_event_stream() {
+	use crate::{Connection, ConnectionState, Error, Identity, IdentityIncreaseLevelState};
+	use futures::StreamExt;
+	let mut connection =
+		Connection::build("127.0.0.1:1").identity(Identity::create()).connect().unwrap();
+	let (send, recv) = tokio::sync::oneshot::channel();
+	drop(send);
+	connection.state = ConnectionState::IdentityLevelIncreasing {
+		recv,
+		state: std::sync::Arc::new(std::sync::Mutex::new(IdentityIncreaseLevelState::Computing)),
+	};
+	assert!(matches!(
+		connection.events().next().await,
+		Some(Err(Error::IdentityLevelIncreaseFailedThread))
+	));
+	assert!(connection.events().next().await.is_none());
+	assert!(connection.events().next().await.is_none());
+}
