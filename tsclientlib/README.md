@@ -20,10 +20,15 @@ Licensed under either of
 
 at your option.
 
-### Opus binding in this fork
+### Audio and cryptography in this fork
 
 Audio uses `opus` with the bundled `opusic-sys` native library. CMake and a C compiler
 are required; a system libopus installation is not required. The `audio` feature
 remains enabled by default. `AudioQueue::get_decoder` and audio errors now expose
 `opus` types. The old `audiopus-unstable` feature is removed; experimental decoder
 controls from the audiopus fork are not supported.
+
+P-256 uses `p256 0.14` and `elliptic-curve >=0.14.3` within the 0.14 series.
+This selects the patched `crypto-bigint` 0.7 series instead of the vulnerable
+0.5 series. TeamSpeak identity formats, UIDs, ECDH output, and DER signature
+encoding are preserved.

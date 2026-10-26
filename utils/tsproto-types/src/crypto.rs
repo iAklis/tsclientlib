@@ -6,9 +6,9 @@ use base64::prelude::*;
 use curve25519_dalek_ng::constants;
 use curve25519_dalek_ng::edwards::{CompressedEdwardsY, EdwardsPoint};
 use curve25519_dalek_ng::scalar::Scalar;
-use elliptic_curve::sec1::{FromEncodedPoint, ToEncodedPoint};
-use generic_array::GenericArray;
-use generic_array::typenum::Unsigned;
+use elliptic_curve::Generate;
+use elliptic_curve::array::typenum::Unsigned;
+use elliptic_curve::sec1::{FromSec1Point, ToSec1Point};
 use num_bigint::{BigInt, Sign};
 use p256::ecdsa::signature::{Signer, Verifier};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -193,16 +193,16 @@ impl EccKeyPubP256 {
 						bytes.resize(field_size, 0);
 						// Convert to big-endian
 						bytes.reverse();
-						Ok(*GenericArray::from_slice(&bytes))
+						bytes.as_slice().try_into().map_err(|_| Error::ParsePublicKeyFailed)
 					};
 					let x_coord = to_coord(x)?;
 					let y_coord = to_coord(y)?;
-					let enc_point = p256::EncodedPoint::from_affine_coordinates(
+					let enc_point = p256::Sec1Point::from_affine_coordinates(
 						&x_coord,
 						&y_coord,
 						false,
 					);
-					let enc_point = p256::PublicKey::from_encoded_point(&enc_point);
+					let enc_point = p256::PublicKey::from_sec1_point(&enc_point);
 					if enc_point.is_some().into() {
 						Ok(Self(enc_point.unwrap()))
 					} else {
@@ -223,7 +223,7 @@ impl EccKeyPubP256 {
 	pub fn to_ts(&self) -> String { BASE64_STANDARD.encode(self.to_tomcrypt()) }
 
 	pub fn to_tomcrypt(&self) -> Vec<u8> {
-		let enc_point = self.0.as_affine().to_encoded_point(false);
+		let enc_point = self.0.as_affine().to_sec1_point(false);
 		// We can unwrap here, creating the public key ensures that it is not the identity point,
 		// which is the only time this returns `None`.
 		let pubkey_x = BigInt::from_bytes_be(Sign::Plus, enc_point.x().unwrap());
@@ -242,7 +242,7 @@ impl EccKeyPubP256 {
 	/// Get the SEC1 encoding of the public key point on the curve.
 	pub fn to_short(&self) -> Vec<u8> {
 		// TODO Maybe compress?
-		self.0.as_affine().to_encoded_point(false).as_bytes().to_vec()
+		self.0.as_affine().to_sec1_point(false).as_bytes().to_vec()
 	}
 
 	/// Compute the uid of this key without encoding it in base64.
@@ -279,7 +279,7 @@ impl EccKeyPubP256 {
 
 impl EccKeyPrivP256 {
 	/// Create a new key key pair.
-	pub fn create() -> Self { Self(p256::SecretKey::random(&mut rand::thread_rng())) }
+	pub fn create() -> Self { Self(p256::SecretKey::generate()) }
 
 	/// Try to import the key from any of the known formats.
 	pub fn import(data: &[u8]) -> Result<Self> {
@@ -318,13 +318,11 @@ impl EccKeyPrivP256 {
 	///
 	/// This is just the `BigNum` of the private key.
 	pub fn from_short(data: &[u8]) -> Result<Self> {
-		// TODO !! p256::SecretKey::from_bytes panics when the data is not 32 long !!
-		// maybe create a pull request for that because das not good?!
 		if data.len() != 32 {
 			Err(Error::NoShortKey)
 		} else {
 			Ok(Self(
-				p256::SecretKey::from_bytes(p256::FieldBytes::from_slice(data))
+				p256::SecretKey::from_slice(data)
 					.map_err(|_| Error::NoShortKey)?,
 			))
 		}
@@ -438,7 +436,7 @@ impl EccKeyPrivP256 {
 	}
 
 	pub fn to_tomcrypt(&self) -> Vec<u8> {
-		let enc_point = self.0.public_key().as_affine().to_encoded_point(false);
+		let enc_point = self.0.public_key().as_affine().to_sec1_point(false);
 		// We can unwrap here, creating the public key ensures that it is not the identity point,
 		// which is the only time this returns `None`.
 		let pubkey_x = BigInt::from_bytes_be(Sign::Plus, enc_point.x().unwrap());
@@ -547,6 +545,45 @@ mod tests {
 		let res1 = priv_key1.create_shared_secret(pub_key2);
 		let res2 = priv_key2.create_shared_secret(pub_key1);
 		assert_eq!(res1.raw_secret_bytes(), res2.raw_secret_bytes());
+	}
+
+	#[test]
+	fn p256_ecdh_known_secret() {
+		let mut first = [0; 32];
+		first[31] = 1;
+		let mut second = [0; 32];
+		second[31] = 2;
+		let first = EccKeyPrivP256::from_short(&first).unwrap();
+		let second = EccKeyPrivP256::from_short(&second).unwrap();
+		let secret = first.create_shared_secret(second.to_pub());
+		// The x coordinate of 2G, independently checked with OpenSSL on P-256.
+		let expected = [
+			0x7c, 0xf2, 0x7b, 0x18, 0x8d, 0x03, 0x4f, 0x7e,
+			0x8a, 0x52, 0x38, 0x03, 0x04, 0xb5, 0x1a, 0xc3,
+			0xc0, 0x89, 0x69, 0xe2, 0x77, 0xf2, 0x1b, 0x35,
+			0xa6, 0x0b, 0x48, 0xfc, 0x47, 0x66, 0x99, 0x78,
+		];
+		assert_eq!(secret.raw_secret_bytes().as_slice(), &expected);
+	}
+
+	#[test]
+	fn p256_signatures_reject_wrong_message_and_key() {
+		let key = EccKeyPrivP256::from_ts(TEST_PRIV_KEY).unwrap();
+		let public = key.to_pub();
+		let message = b"TeamSpeak signature compatibility";
+		let signature = key.sign(message);
+		public.verify(message, &signature).unwrap();
+		assert!(public.verify(b"modified message", &signature).is_err());
+		assert!(EccKeyPrivP256::create().to_pub().verify(message, &signature).is_err());
+	}
+
+	#[test]
+	fn p256_short_key_rejects_invalid_scalars_and_lengths() {
+		for len in [0, 1, 24, 31, 33, 64] {
+			assert!(EccKeyPrivP256::from_short(&vec![1; len]).is_err());
+		}
+		assert!(EccKeyPrivP256::from_short(&[0; 32]).is_err());
+		assert!(EccKeyPrivP256::from_short(&[0xff; 32]).is_err());
 	}
 
 	#[test]

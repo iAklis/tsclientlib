@@ -20,12 +20,11 @@ include = [
 base64 = "0.22"
 bitflags = { version = "2", features = ["serde"] }
 curve25519-dalek-ng = "4"
-elliptic-curve = { version = "0.13", features = ["ecdh"] }
-generic-array = "0.14"
+elliptic-curve = { version = "0.14.3", features = ["ecdh"] }
 num-bigint = "0.4"
 num-derive = "0.4"
 num-traits = "0.2"
-p256 = { version = "0.13", features = ["ecdh", "ecdsa"] }
+p256 = { version = "0.14", features = ["ecdh", "ecdsa"] }
 rand = "0.8"
 ref-cast = "1"
 serde = { version = "1", features = ["derive"] }
