@@ -19,3 +19,11 @@ Licensed under either of
  * [MIT license](../LICENSE-MIT)
 
 at your option.
+
+### Opus binding in this fork
+
+Audio uses `opus` with the bundled `opusic-sys` native library. CMake and a C compiler
+are required; a system libopus installation is not required. The `audio` feature
+remains enabled by default. `AudioQueue::get_decoder` and audio errors now expose
+`opus` types. The old `audiopus-unstable` feature is removed; experimental decoder
+controls from the audiopus fork are not supported.
