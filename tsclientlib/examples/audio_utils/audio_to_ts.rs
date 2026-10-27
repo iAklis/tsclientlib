@@ -2,10 +2,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, format_err};
-use audiopus::coder::Encoder;
 use cpal::traits::{DeviceTrait, StreamTrait};
 use cpal::{Device, Stream, StreamConfig};
 use futures::prelude::*;
+use opus::Encoder;
 use tokio::sync::mpsc;
 use tokio::task::LocalSet;
 use tokio::time::{self, Duration};
@@ -62,12 +62,8 @@ impl AudioToTs {
 			buffer_size: cpal::BufferSize::Fixed(USUAL_FRAME_SIZE as u32),
 		};
 
-		let encoder = Encoder::new(
-			audiopus::SampleRate::Hz48000,
-			audiopus::Channels::Mono,
-			audiopus::Application::Voip,
-		)
-		.expect("Could not create encoder");
+		let encoder = Encoder::new(48_000, opus::Channels::Mono, opus::Application::Voip)
+			.expect("Could not create encoder");
 		let mut callback = Callback {
 			listener: self.listener.clone(),
 			encoder,
